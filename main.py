@@ -1,74 +1,96 @@
 import os
 import socket
 import paramiko
+import logging
 from paramiko import RSAKey, ServerInterface
 
-# Define a basic SSH server interface
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+
 class SimpleSSHServer(ServerInterface):
+    def __init__(self, allowed_users=None):
+        self.allowed_users = allowed_users if allowed_users else {"user": "pass"}
+
     def check_auth_password(self, username, password):
-        if username == "user" and password == "pass":
+        if username in self.allowed_users and self.allowed_users[username] == password:
+            logging.info(f"Authentication successful for user: {username}")
             return paramiko.AUTH_SUCCESSFUL
+        logging.warning(f"Authentication failed for user: {username}")
         return paramiko.AUTH_FAILED
 
     def check_channel_request(self, kind, chanid):
         if kind == "session":
+            logging.info(f"Channel request {kind} accepted.")
             return paramiko.OPEN_SUCCEEDED
+        logging.warning(f"Channel request {kind} denied.")
         return paramiko.OPEN_FAILED_ADMINISTRATIVELY_PROHIBITED
 
-# Start the SSH server
-def start_ssh_server():
-    # Generate host key if it does not exist
-    host_key_path = "server_rsa.key"
-    if not os.path.exists(host_key_path):
+def generate_or_load_host_key(key_path="server_rsa.key"):
+    if not os.path.exists(key_path):
+        logging.info("Generating new RSA host key.")
         key = RSAKey.generate(2048)
-        key.write_private_key_file(host_key_path)
+        key.write_private_key_file(key_path)
     else:
-        key = RSAKey(filename=host_key_path)
-    
-    # Set up the SSH server
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server_socket.bind(("0.0.0.0", 2200))  # Listening on all interfaces at port 2200
-    server_socket.listen(100)
-    print("Listening for connection on port 2200...")
+        logging.info("Loading existing RSA host key.")
+        key = RSAKey(filename=key_path)
+    return key
 
-    client_socket, addr = server_socket.accept()
-    print(f"Connection from {addr}")
-
-    # Start the SSH session
-    ssh_session = paramiko.Transport(client_socket)
-    ssh_session.add_server_key(key)
-    ssh_server = SimpleSSHServer()
-
+def handle_client(channel):
     try:
-        ssh_session.start_server(server=ssh_server)
-    except paramiko.SSHException as e:
-        print(f"SSH negotiation failed: {e}")
-        return
-
-    # Accept the client channel and handle input/output
-    channel = ssh_session.accept(20)
-    if channel is None:
-        print("No channel request received")
-        return
-
-    print("Authenticated successfully")
-    channel.send("Welcome to the SSH server!\n")
-    
-    while True:
-        try:
-            command = channel.recv(1024).decode("utf-8")
-            if command.strip().lower() == "exit":
+        channel.send("Welcome to the SSH server!\nType 'exit' to disconnect.\n")
+        while True:
+            command = channel.recv(1024).decode("utf-8").strip()
+            if not command:
+                continue
+            if command.lower() == "exit":
                 channel.send("Goodbye!\n")
                 break
             response = f"Received: {command}\n"
+            logging.info(f"Client command: {command}")
             channel.send(response)
-        except Exception as e:
-            print(f"Error: {e}")
-            break
+    except Exception as e:
+        logging.error(f"Error handling client: {e}")
+    finally:
+        channel.close()
 
-    channel.close()
-    ssh_session.close()
+def start_ssh_server(host="0.0.0.0", port=2200, allowed_users=None):
+    host_key = generate_or_load_host_key()
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((host, port))
+    server_socket.listen(100)
+    logging.info(f"Listening for connections on {host}:{port}...")
+
+    while True:
+        client_socket, addr = server_socket.accept()
+        logging.info(f"Connection received from {addr}")
+
+        try:
+            ssh_session = paramiko.Transport(client_socket)
+            ssh_session.add_server_key(host_key)
+            ssh_server = SimpleSSHServer(allowed_users=allowed_users)
+
+            try:
+                ssh_session.start_server(server=ssh_server)
+            except paramiko.SSHException as e:
+                logging.error(f"SSH negotiation failed: {e}")
+                continue
+
+            channel = ssh_session.accept(20)
+            if channel is None:
+                logging.warning("No channel request received. Closing connection.")
+                continue
+
+            logging.info("Authenticated successfully, starting session.")
+            handle_client(channel)
+        except Exception as e:
+            logging.error(f"Exception in connection handling: {e}")
+        finally:
+            ssh_session.close()
 
 if __name__ == "__main__":
-    start_ssh_server()
+    # Customizable allowed users
+    allowed_users = {"user": "pass", "admin": "admin123"}  # Update with real users
+
+    # Start the SSH server
+    start_ssh_server(host="0.0.0.0", port=2200, allowed_users=allowed_users)
